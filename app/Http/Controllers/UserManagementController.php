@@ -1,0 +1,139 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Mail\ForgotPassword;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Password;
+use Symfony\Component\Mailer\Exception\TransportExceptionInterface;
+
+class UserManagementController extends Controller
+{
+    public function index(Request $request)
+    {
+        $mapUser = function ($user) {
+            return [
+                'id'      => $user->id,
+                'name'    => $user->name,
+                'email'   => $user->email,
+                'roles'   => $user->getRoleNames()->toArray(),
+                'phone'   => $user->phone,
+                'address' => $user->address,
+                'avatar'  => $user->avatar,
+                'status'  => $user->status,
+            ];
+        };
+
+        $activeTab = in_array($request->query('user_tab'), ['all', 'client'], true)
+            ? $request->query('user_tab')
+            : 'staff';
+
+        $allUsers = User::query()
+            ->whereDoesntHave('roles', function ($query) {
+                $query->where('name', 'admin');
+            })
+            ->paginate(10, ['*'], 'all_page')
+            ->appends(['user_tab' => 'all'])
+            ->through($mapUser);
+
+        $staffUsers = User::role('staff')
+            ->paginate(10, ['*'], 'staff_page')
+            ->appends(['user_tab' => 'staff'])
+            ->through($mapUser);
+
+        $clientUsers = User::role('client')
+            ->paginate(10, ['*'], 'client_page')
+            ->appends(['user_tab' => 'client'])
+            ->through($mapUser);
+
+        return view('pages.user-management.user-management', compact(
+            'allUsers',
+            'staffUsers',
+            'clientUsers',
+            'activeTab'
+        ));
+    }
+
+    public function update(Request $request, $id)
+    {
+        $validated = $request->validate([
+            'name'    => 'required|string|max:255',
+            'email'   => 'required|email|unique:users,email,' . $id,
+            'phone'   => ['nullable', 'string', 'max:13', 'regex:/^(?:09\d{9}|\+63\d{10})$/'],
+            'address' => 'nullable|string|max:500',
+        ]);
+
+        $user = User::findOrFail($id);
+        $user->update($validated);
+
+        return redirect()->back()->with('success', 'User updated successfully.');
+    }
+
+    public function addStaff(Request $request)
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'email' => 'required|email|unique:users,email',
+            'password' => 'required|min:6',
+        ]);
+
+        // dd($validated);
+
+        $user = User::create([
+            'name' => $validated['name'],
+            'email' => $validated['email'],
+            'password' => Hash::make($validated['password']),
+        ]);
+
+        $user->assignRole('staff');
+
+        return redirect()
+            ->route('user-management.index')
+            ->with('success', 'Staff user created successfully.');
+    }
+
+    public function deactivateStatus(Request $request, $id)
+    {
+        $user = User::findOrFail($id);
+        $user->status = 'inactive';
+        $user->save();
+
+        return redirect()->route('user-management.index')->with('success', 'User status updated successfully.');
+    }
+
+    public function activateStatus(Request $request, $id)
+    {
+        $user = User::findOrFail($id);
+        $user->status = 'active';
+        $user->save();
+
+        return redirect()->route('user-management.index')->with('success', 'User status updated successfully.');
+    }
+
+    public function resetPassword(Request $request, $id)
+    {
+        $user = User::findOrFail($id);
+        $token = Password::createToken($user);
+
+        try {
+            Mail::to($user->email)->send(new ForgotPassword($token, $user->email));
+        } catch (TransportExceptionInterface $exception) {
+            Log::warning('Unable to deliver admin password reset email.', [
+                'user_id' => $user->id,
+                'exception' => $exception::class,
+            ]);
+
+            return back()->withErrors([
+                'email' => 'Could not send the password reset email. Verify the address and try again.',
+            ]);
+        }
+
+        return redirect()
+            ->back()
+            ->with('success', "Password reset link sent to {$user->email}.");
+    }
+}

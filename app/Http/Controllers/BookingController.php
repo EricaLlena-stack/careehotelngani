@@ -1,0 +1,301 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Booking;
+use App\Models\WalkInBooking;
+use Carbon\Carbon;
+use App\Models\Room;
+use Illuminate\Support\Facades\Mail;
+use App\Mail\StatusEmail;
+use Illuminate\Pagination\LengthAwarePaginator;
+
+use Illuminate\Http\Request;
+
+class BookingController extends Controller
+{
+
+    public function myReservations()
+    {
+        $user = auth()->user();
+
+        $userId = $user ? $user->getKey() : null;
+
+        // dd($userId);
+
+        $pendingBookings = Booking::where('user_id', $userId)
+            ->where('status', 'Pending')
+            ->get()->transform(function ($booking) {
+                $booking->check_in = $booking->check_in ? Carbon::parse($booking->check_in)->toDateString() : null;
+                $booking->check_out = $booking->check_out ? Carbon::parse($booking->check_out)->toDateString() : null;
+                return $booking;
+            });
+
+        // dd($pendingBookings);
+
+        $confirmedBookings = Booking::where('user_id', $userId)
+            ->where('status', 'Confirmed')
+            ->get()
+            ->transform(function ($booking) {
+                $booking->check_in = $booking->check_in ? Carbon::parse($booking->check_in)->toDateString() : null;
+                $booking->check_out = $booking->check_out ? Carbon::parse($booking->check_out)->toDateString() : null;
+                return $booking;
+            });
+
+        // dd($confirmedBookings);
+
+        return view('pages.chms-features.my-reservations.reservation', compact('pendingBookings', 'confirmedBookings'));
+    }
+
+
+    public function pending(Request $request)
+    {
+        $onlineBookings = Booking::with('user.idVerification')
+            ->whereIn('status', ['Pending', 'Confirmed', 'Checked In'])
+            ->get()->map(function ($booking) {
+                $booking->booking_type = 'Online';
+                return $booking;
+            });
+
+        $walkInBookings = WalkInBooking::whereIn('status', ['Pending', 'Confirmed', 'Checked In'])
+            ->get()
+            ->map(function ($booking) {
+                $booking->booking_type = 'Walk-in';
+                return $booking;
+            });
+
+        $items = $onlineBookings->concat($walkInBookings)->map(function ($booking) {
+            $booking->sort_date = in_array($booking->status, ['Confirmed', 'Checked In'])
+                ? $booking->updated_at
+                : $booking->created_at;
+
+            return $booking;
+        })->sortByDesc('sort_date')->values();
+
+
+        $perPage = 15;
+        $currentPage = LengthAwarePaginator::resolveCurrentPage();
+        $currentItems = $items->slice(($currentPage - 1) * $perPage, $perPage)->values();
+
+        $bookings = new LengthAwarePaginator($currentItems, $items->count(), $perPage, $currentPage, [
+            'path' => $request->url(),
+            'query' => $request->query(),
+        ]);
+
+        $availableRooms = Room::where('status', 'Available')->orderBy('room_type')->orderBy('floor')->orderBy('room_no')->get();
+
+        return view('pages.chms-features.booking-management.pending-booking', compact('bookings', 'availableRooms'));
+    }
+
+    public function confirmBooking(Request $request, $selectedRef)
+    {
+        $request->validate([
+            'room_id' => 'required|exists:rooms,id',
+        ]);
+
+        $booking = Booking::where('reference_number', $selectedRef)->firstOrFail();
+
+        $room = Room::whereKey($request->input('room_id'))
+            ->where('status', 'Available')
+            ->where('room_type', $booking->room_type)
+            ->firstOrFail();
+
+        $requestedFloor = trim(str_replace('Floor ', '', (string) $booking->floor_level));
+
+        $hasRequestedFloorRoom = $requestedFloor !== '' && Room::where('status', 'Available')
+            ->where('room_type', $booking->room_type)
+            ->where('floor', $requestedFloor)
+            ->exists();
+
+        if ($hasRequestedFloorRoom && (string) $room->floor !== $requestedFloor) {
+            return back()->withErrors([
+                'room_id' => 'Please assign an available room on the guest\'s requested floor.',
+            ])->withInput();
+        }
+
+        $booking->status = 'Confirmed';
+        $booking->room_id = $request->input('room_id');
+        $booking->save();
+
+        $room->status = 'Occupied';
+        $room->save();
+
+        // dd('Everything before email works', [
+        //     'booking' => $booking->id,
+        //     'room' => $room->id,
+        //     'user' => $booking->user,
+        //     'email' => $booking->user?->email,
+        // ]);
+
+        Mail::to($booking->user->email)->send(new StatusEmail($booking));
+
+        return redirect()->route('booking.pending')->with('success', 'Booking confirmed successfully.');
+    }
+
+    public function confirmed()
+    {
+        $confirmedBookings = Booking::where('status', 'Confirmed')
+            ->latest()
+            ->paginate(15);
+
+        return view('pages.chms-features.booking-management.confirmed-booking', compact('confirmedBookings'));
+    }
+
+    public function checkInActivate(Request $request, $selectedRef)
+    {
+        $booking = Booking::where('reference_number', $selectedRef)->firstOrFail();
+
+        // Update the booking status to checked in
+        $booking->status = 'Checked In';
+        $booking->save();
+
+        return redirect()->route('booking.pending')->with('success', 'Booking checked in successfully.');
+    }
+
+    public function checkedInBookings(Request $request)
+    {
+        $onlineBookings = Booking::where('status', 'Checked In')
+            ->get()
+            ->map(function ($booking) {
+                $booking->booking_type = 'Online';
+                return $booking;
+            });
+
+        $walkInBookings = WalkInBooking::where('status', 'Checked In')
+            ->get()
+            ->map(function ($booking) {
+                $booking->booking_type = 'Walk-in';
+                return $booking;
+            });
+
+        $items = $onlineBookings
+            ->concat($walkInBookings)
+            ->sortByDesc('created_at')
+            ->values();
+
+        $perPage = 15;
+        $currentPage = LengthAwarePaginator::resolveCurrentPage();
+        $currentItems = $items->slice(($currentPage - 1) * $perPage, $perPage)->values();
+
+        $checkedInBookings = new LengthAwarePaginator($currentItems, $items->count(), $perPage, $currentPage, [
+            'path' => $request->url(),
+            'query' => $request->query(),
+        ]);
+
+        return view('pages.chms-features.booking-management.checkedin-booking', compact('checkedInBookings'));
+    }
+
+    public function earlyCheckout(Request $request, $selectedRef)
+    {
+        // Search Online bookings first; fall back to Walk-in if not found
+        $booking = Booking::where('reference_number', $selectedRef)->first()
+            ?? WalkInBooking::where('reference_number', $selectedRef)->firstOrFail();
+
+        // Update booking status
+        $booking->status = 'Completed';
+        $booking->save();
+
+        // Update assigned room status to available
+        if ($booking->room_id) {
+            $room = Room::find($booking->room_id);
+
+            if ($room) {
+                $room->status = 'Available';
+                $room->save();
+            }
+        }
+
+        return redirect()->route('booking.history')->with('success', 'Booking completed successfully.');
+    }
+
+
+    public function bookingHistory()
+    {
+        $statuses = ['Cancelled', 'Completed', 'Archived'];
+
+        if (auth()->user()->hasRole('staff')) {
+
+            $onlineBookings = Booking::with('user')
+                ->whereIn('status', $statuses)
+                ->get()
+                ->map(function ($booking) {
+                    $booking->booking_type = 'Online';
+                    return $booking;
+                });
+
+            $walkInBookings = WalkInBooking::whereIn('status', $statuses)
+                ->get()
+                ->map(function ($booking) {
+                    $booking->booking_type = 'Walk-in';
+                    return $booking;
+                });
+
+            $items = $onlineBookings
+                ->concat($walkInBookings)
+                ->sortByDesc('created_at')
+                ->values();
+
+            $perPage = 15;
+            $currentPage = LengthAwarePaginator::resolveCurrentPage();
+            $currentItems = $items->slice(($currentPage - 1) * $perPage, $perPage)->values();
+
+            $bookingHistory = new LengthAwarePaginator($currentItems, $items->count(), $perPage, $currentPage, [
+                'path' => request()->url(),
+                'query' => request()->query(),
+            ]);
+
+            return view('pages.chms-features.booking-management.booking-history', compact('bookingHistory'));
+        } else if (auth()->user()->hasRole('client')) {
+
+            $bookingHistory = Booking::whereIn('status', $statuses)
+                ->where('user_id', auth()->id())
+                ->latest()
+                ->paginate(15);
+
+            // Appends booking_type inline so your common view structure doesn't break
+            $bookingHistory->getCollection()->transform(function ($booking) {
+                $booking->booking_type = 'Online';
+                return $booking;
+            });
+
+            return view('pages.chms-features.booking-management.booking-history', compact('bookingHistory'));
+        }
+    }
+
+    public function cancelBooking(Request $request, $selectedRef)
+    {
+        $booking = Booking::where('reference_number', $selectedRef)->firstOrFail();
+
+        //validation
+        $request->validate([
+            'remarks' => 'nullable|string|max:255',
+        ]);
+
+        // Update the booking status to cancelled
+        $booking->status = 'Cancelled';
+        $booking->remarks = $request->input('remarks');
+        $booking->save();
+
+        // If the booking had an assigned room, update that room's status to available
+        if ($booking->room_id) {
+            $room = Room::find($booking->room_id);
+            if ($room) {
+                $room->status = 'Available';
+                $room->save();
+            }
+        }
+
+        Mail::to($booking->user->email)->send(new StatusEmail($booking));
+
+        return redirect()->route('booking.history')->with('success', 'Booking cancelled successfully.');
+    }
+
+    public function deleteBooking(Request $request, $selectedRef)
+    {
+        $booking = Booking::where('reference_number', $selectedRef)->firstOrFail();
+
+        $booking->delete();
+
+        return redirect()->route('booking.pending')->with('success', 'Booking deleted successfully.');
+    }
+}
